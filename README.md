@@ -1,13 +1,13 @@
 # kafka-proto-gen
 
-Generates fake Protobuf events from a JSON plan and publishes them to Kafka, or prints them for a dry run.
+Generates fake events from a JSON plan and publishes them to Kafka, or prints them for a dry run. Payloads can be binary Protobuf, Protobuf encoded as JSON, or schemaless JSON.
 
 - Fills every field with [Faker](https://fakerjs.dev) data, unless a rule says otherwise.
 - Builds **datasets** of reference data at startup (users, customers, contracts…), which can be derived from and linked to each other like database tables.
 - Links related events through **pools**. For example, `OrderPaid` reuses the `orderId`, amount and `traceparent` of an earlier `OrderCreated`.
 - Picks event types by weight, or produces an exact count of each.
 - Sends at a fixed rate in batches grouped by topic, with Kafka keys and headers.
-- Checks the plan against the `.proto` files at startup, so typos fail before anything is sent.
+- Checks the plan against the `.proto` files and payload definitions at startup, so typos fail before anything is sent.
 
 ## Requirements
 
@@ -43,6 +43,7 @@ plans/plan.json           simple order lifecycle, mixed by weight
 plans/plan-quotas.json    the same lifecycle with exact counts per event
 plans/plan-datasets.json  full example: users → customers → contracts, orders, payments, refunds
 plans/plan-small.json     small example (22 messages) of a full order lifecycle, easy to check by eye
+plans/plan-json.json      mixes JSON from a proto, binary Protobuf and a schemaless JSON event
 plans/order.proto         schema used by the example plans
 ```
 
@@ -86,7 +87,9 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | Key       | Description |
 |-----------|-------------|
 | `type`    | Fully qualified message type, e.g. `shop.OrderCreated` (required) |
-| `proto`   | `.proto` file containing the type (required) |
+| `proto`   | `.proto` file containing the type (required, unless `payload` is set) |
+| `format`  | `"protobuf"` (default) or `"json"` (see [Payload formats](#payload-formats)) |
+| `payload` | Field path → rule, for a schemaless JSON event without a proto (see [Payload formats](#payload-formats)) |
 | `topic`   | Kafka topic (required) |
 | `weight`  | How often this event is picked relative to others (default `1`) |
 | `count`   | Exact number of messages for this event (see [Weights or quotas](#weights-or-quotas)) |
@@ -109,6 +112,53 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 ]
 ```
 
+### Payload formats
+
+Each event chooses how its value is encoded. One plan can mix all three.
+
+| | Binary Protobuf | Protobuf as JSON | Schemaless JSON |
+|---|---|---|---|
+| Set with | nothing (default) | `"format": "json"` | `"payload": { ... }` in place of `proto` and `rules` |
+| Shape defined by | the `.proto` | the `.proto` | the payload rules alone |
+| Fields without a rule | filled automatically | filled automatically | none: list every field |
+| Startup field checks | yes | yes | paths checked against the payload |
+
+**Protobuf as JSON** uses the standard [Protobuf JSON mapping](https://protobuf.dev/programming-guides/json/), so it matches what Protobuf libraries in other languages produce:
+
+- enums are names (`"BANK_TRANSFER"`)
+- `int64` values are strings, with no precision loss (`"9007199254740993"`)
+- `bytes` values are base64
+- `google.protobuf.Timestamp` values are RFC 3339 strings (`"2026-10-29T06:07:33.208Z"`)
+- fields left at their default value are omitted
+
+**Schemaless JSON** builds the value from `payload` rules alone. Dotted paths create nested objects, and `field` rules can use values set earlier in the payload:
+
+```json
+{ "type": "logistics.ShipmentCreated", "topic": "shipments", "key": "shipmentId",
+  "payload": {
+    "shipmentId":       { "regex": "SHP-[0-9]{6}", "unique": true },
+    "orderId":          { "from": "paid.id", "take": true },
+    "customer.name":    { "from": "paid.order.customer.name" },
+    "customer.country": { "from": "paid.order.customer.country.code" },
+    "address.city":     { "faker": "location.city", "locale": { "from": "paid.order.customer.country.locale" } },
+    "address.country":  { "field": "customer.country" },
+    "createdAt":        { "iso": "recent" }
+  } }
+```
+
+```json
+{ "shipmentId": "SHP-282231", "orderId": "ORD-762",
+  "customer": { "name": "Mme Dorothée Prevost", "country": "FR" },
+  "address":  { "city": "Issy-les-Moulineaux", "country": "FR" },
+  "createdAt": "2026-10-29T05:55:57.492Z" }
+```
+
+`type` is just the event's name here, used for `typeHeader` and messages. A payload is always sent as JSON, and `defaults.payload` is merged into it like `rules` are.
+
+In both JSON formats the value is UTF-8 JSON. The content type isn't set automatically: add a `content-type` header, e.g. `{ "static": "application/json" }`.
+
+Messages are sent as plain bytes in every format, without the Confluent Schema Registry header (magic byte and schema ID). Consumers that use Confluent's deserializers will reject them.
+
 ### Field paths
 
 Field paths use the camelCase names protobufjs generates (`order_id` → `orderId`) and dots for nesting: `items.sku`. A rule on a repeated field applies to every element. A rule on a field inside a `oneof` makes that branch always chosen.
@@ -126,7 +176,7 @@ Field paths use the camelCase names protobufjs generates (`order_id` → `orderI
 | `email`       | `{ "email": true }` | A random email address |
 | `faker`       | `{ "faker": "person.fullName" }` | Any [Faker](https://fakerjs.dev/api/) function, with optional `"args": [...]` |
 | `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`) |
-| `field`       | `{ "field": "orderId" }` | A value from the record being built. **Headers and datasets only** |
+| `field`       | `{ "field": "orderId" }` | A value from the record being built. **Headers, payloads and datasets only** |
 | `from`        | `{ "from": "contracts.currency" }` | A value from a dataset or pool (see [Reading](#reading-datasets-and-pools)) |
 | `ref`         | `{ "ref": "customers" }` | A whole record from a dataset or pool, as a link (same as `from` without a property) |
 
@@ -363,12 +413,14 @@ Every payment carries its order's amount, currency, customer email and trace. Ev
 
 Before any message is generated or sent, the plan is checked and the run stops with a clear error if:
 
-- an event is missing `type`, `proto` or `topic`, or the proto or type can't be loaded
+- an event is missing `type`, `topic`, or a `proto` or `payload`, or the proto or type can't be loaded
+- an event has an unknown `format`, or combines `payload` with `proto`, `rules` or `"format": "protobuf"`
+- a payload sets both an object and a field inside it (`customer` and `customer.name`)
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
 - `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
-- a rule path, `key` or pool record path doesn't exist in the message
-- a `field` rule is used on a message field
+- a rule path, `key` or pool record path doesn't exist in the message or payload
+- a `field` rule is used on a Protobuf message field
 - a `from`, `ref` or `$from` names a dataset, pool or sub-pool that doesn't exist
 - an event takes from all of a split collection instead of one sub-pool
 - a dataset reads a pool, datasets depend on each other in a loop, or a derived dataset wants more records than its source has
@@ -383,4 +435,4 @@ For example:
 Error: shop.OrderPaid rules.orderId: pool "order" has no sub-pool "toPai" (it has toPay, toCancel, open)
 ```
 
-Messages are also checked with protobufjs before encoding.
+Protobuf messages are also checked with protobufjs before encoding.

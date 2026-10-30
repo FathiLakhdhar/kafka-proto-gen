@@ -13,13 +13,24 @@ const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !=
 const D = plan.defaults || {};
 const events = plan.events.map((e) => {
   const m = { ...D, ...e, rules: clean({ ...D.rules, ...e.rules }), headers: clean({ ...D.headers, ...e.headers }) };
+  if (e.payload) { // schemaless JSON event: the payload rules replace the proto schema
+    if (e.proto || e.rules) throw Error(`${e.type}: an event with "payload" can't also have "proto" or "rules"`);
+    if (m.format && m.format !== "json") throw Error(`${e.type}: an event with "payload" is always sent as JSON`);
+    m.payload = clean({ ...D.payload, ...e.payload });
+    m.format = "json";
+    m.rules = {};
+    delete m.proto;
+  } else delete m.payload;
+  m.format ??= "protobuf";
   if (m.pool) m.pools = { ...m.pools, [m.pool.name]: m.pool.add }; // old single-pool syntax
   delete m.pool;
   m.pools ??= {};
   return m;
 });
 events.forEach((e) => {
-  if (!e.type || !e.proto || !e.topic) throw Error(`event needs type, proto, topic: ${JSON.stringify(e.type)}`);
+  if (!e.type || !e.topic || !(e.proto || e.payload))
+    throw Error(`event needs type, topic, and a proto or a payload: ${JSON.stringify(e.type)}`);
+  if (!["protobuf", "json"].includes(e.format)) throw Error(`${e.type}: "format" must be "protobuf" or "json"`);
 });
 
 // ---- weights or quotas ----
@@ -298,26 +309,42 @@ for (const n of dsOrder) {
 }
 picked = {};
 
-// ---- events: check against their proto ----
+// ---- events: check against their proto or payload ----
 // needs: keys an event reads without a fallback; the event is only eligible once they have records
 const needs = new Map();
 const takes = new Map(); // subset of needs the event removes a record from
 events.forEach((e) => {
-  const Type = typeOf(e);
   const reads = [];
-  for (const [p, r] of Object.entries(e.rules)) {
-    checkPath(Type, p, `${e.type} rules`);
-    if (checkRule(r, `${e.type} rules.${p}`, reads) === "field")
-      throw Error(`${e.type} rules.${p}: "field" rules only work in headers and datasets`);
+  let checkField;
+  if (e.payload) {
+    const paths = Object.keys(e.payload);
+    for (const [p, r] of Object.entries(e.payload)) {
+      const clash = paths.find((q) => q.startsWith(p + "."));
+      if (clash) throw Error(`${e.type} payload: sets both "${p}" and "${clash}"`);
+      checkRule(r, `${e.type} payload.${p}`, reads);
+    }
+    // a path can name a payload value, an object above it, or a property inside a linked record
+    checkField = (p, where) => {
+      if (!paths.some((q) => q === p || q.startsWith(p + ".") || p.startsWith(q + ".")))
+        throw Error(`${where}: no field "${p}" in the payload of ${e.type}`);
+    };
+  } else {
+    const Type = typeOf(e);
+    checkField = (p, where) => checkPath(Type, p, where);
+    for (const [p, r] of Object.entries(e.rules)) {
+      checkPath(Type, p, `${e.type} rules`);
+      if (checkRule(r, `${e.type} rules.${p}`, reads) === "field")
+        throw Error(`${e.type} rules.${p}: "field" rules only work in headers, payloads and datasets`);
+    }
   }
   for (const [h, r] of Object.entries(e.headers)) checkRule(r, `${e.type} headers.${h}`, reads);
-  if (e.key) checkPath(Type, e.key, `${e.type} key`);
+  if (e.key) checkField(e.key, `${e.type} key`);
   for (const [pn, add] of Object.entries(e.pools))
     for (const [k, src] of Object.entries(add)) {
       const where = `${e.type} pools.${pn}.${k}`;
       if (src.startsWith("$header.")) continue;
       if (src.startsWith("$from.")) reads.push({ key: parseSpec(src.slice(6)).key, take: false }), checkSpec(src.slice(6), where);
-      else checkPath(Type, src, where);
+      else checkField(src, where);
     }
   needs.set(e, new Set(reads.map((x) => x.key)));
   takes.set(e, new Set(reads.filter((x) => x.take).map((x) => x.key)));
@@ -408,20 +435,57 @@ function gen(type, rules, depth = 0, prefix = "") {
   return o;
 }
 
+// schemaless payload: dotted paths build nested objects; "field" rules see the values set so far
+function buildPayload(e) {
+  const o = {};
+  for (const [p, r] of Object.entries(e.payload)) {
+    const keys = p.split(".");
+    let t = o;
+    for (const k of keys.slice(0, -1)) t = t[k] ??= {};
+    t[keys.at(-1)] = byRuleIn(`${e.type}.${p}`, r, o);
+  }
+  return o;
+}
+
+// proto3 JSON mapping: enum names, int64 as strings, bytes as base64, Timestamp as RFC 3339
+const VIEW = { enums: String, longs: String, bytes: String };
+function protoJson(type, obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const f = type.fields[k];
+    const one = (x) => isTs(f.resolvedType)
+      ? new Date(Number(x.seconds) * 1000 + Math.round((x.nanos || 0) / 1e6)).toISOString()
+      : f.resolvedType instanceof protobuf.Type ? protoJson(f.resolvedType, x) : x;
+    out[k] = f.map ? Object.fromEntries(Object.entries(v).map(([mk, mv]) => [mk, one(mv)]))
+      : Array.isArray(v) ? v.map(one) : one(v);
+  }
+  return out;
+}
+
 function makeMessage(i) {
   const eligible = events.filter((e) => (!quotas || left.get(e) > 0) && [...needs.get(e)].every((k) => sizeOf(k) > 0));
   if (!eligible.length) throw Error("no event can run: every remaining event needs a record from an empty dataset or pool");
   const e = faker.helpers.weightedArrayElement(
     eligible.map((x) => ({ weight: quotas ? left.get(x) : x.weight ?? 1, value: x })));
   if (quotas) left.set(e, left.get(e) - 1);
-  const Type = typeOf(e);
   picked = {};
 
-  const obj = gen(Type, e.rules);
-  const msg = Type.fromObject(obj); // converts enum names, map keys, nested objects
-  const err = Type.verify(msg);
-  if (err) throw Error(`${e.type}: ${err}`);
-  const bytes = Buffer.from(Type.encode(msg).finish());
+  // obj: values the rules see; shown: what the dry run prints; bytes: what goes on the wire
+  let obj, shown, bytes;
+  if (e.payload) shown = obj = buildPayload(e);
+  else {
+    const Type = typeOf(e);
+    obj = gen(Type, e.rules);
+    const msg = Type.fromObject(obj); // converts enum names, map keys, nested objects
+    const err = Type.verify(msg);
+    if (err) throw Error(`${e.type}: ${err}`);
+    if (e.format === "json") shown = protoJson(Type, Type.toObject(msg, VIEW));
+    else {
+      bytes = Buffer.from(Type.encode(msg).finish());
+      shown = Type.toObject(Type.decode(bytes), VIEW);
+    }
+  }
+  if (e.format === "json") bytes = Buffer.from(JSON.stringify(shown));
 
   const headers = {};
   if (plan.typeHeader) headers[plan.typeHeader] = e.type;
@@ -444,11 +508,12 @@ function makeMessage(i) {
     const dir = path.resolve(planDir, plan.outDir);
     fs.mkdirSync(dir, { recursive: true });
     const short = e.type.split(".").pop();
-    fs.writeFileSync(path.join(dir, `${String(i + 1).padStart(4, "0")}-${short}.protobin`), bytes);
+    const ext = e.format === "json" ? "json" : "protobin";
+    fs.writeFileSync(path.join(dir, `${String(i + 1).padStart(4, "0")}-${short}.${ext}`), bytes);
   }
 
   const k = e.key ? get(obj, e.key) : undefined;
-  return { topic: e.topic, Type, bytes, msg: { key: k != null ? String(k) : null, value: bytes, headers } };
+  return { topic: e.topic, shown, msg: { key: k != null ? String(k) : null, value: bytes, headers } };
 }
 
 // ---- run ----
@@ -475,10 +540,8 @@ process.on("SIGINT", () => {
       const batch = Array.from({ length: n }, (_, j) => makeMessage(sent + j));
 
       if (plan.dryRun) {
-        const view = { enums: String, longs: String, bytes: String };
         batch.forEach((b) => console.log(JSON.stringify({
-          topic: b.topic, key: b.msg.key, headers: b.msg.headers,
-          value: b.Type.toObject(b.Type.decode(b.bytes), view),
+          topic: b.topic, key: b.msg.key, headers: b.msg.headers, value: b.shown,
         })));
       } else {
         const byTopic = {};

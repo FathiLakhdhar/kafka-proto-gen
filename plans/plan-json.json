@@ -1,0 +1,88 @@
+{
+  "dryRun": true,
+  "typeHeader": "event-type",
+
+  "datasets": {
+    "countries": {
+      "records": [
+        { "code": "FR", "locale": "fr", "currency": "EUR" },
+        { "code": "DE", "locale": "de", "currency": "EUR" },
+        { "code": "ES", "locale": "es", "currency": "EUR" }
+      ]
+    },
+    "customers": {
+      "size": 4,
+      "fields": {
+        "id":      { "regex": "CUS-[0-9]{4}", "unique": true },
+        "country": { "ref": "countries" },
+        "name":    { "faker": "person.fullName", "locale": { "field": "country.locale" } },
+        "email":   { "email": true, "locale": { "field": "country.locale" }, "unique": true }
+      }
+    }
+  },
+
+  "pools": {
+    "order": {},
+    "paid":  {}
+  },
+
+  "defaults": {
+    "topic": "orders",
+    "proto": "order.proto",
+    "key": "orderId",
+    "headers": { "traceparent": { "traceparent": {} } }
+  },
+
+  "events": [
+    {
+      "type": "shop.OrderCreated", "count": 4,
+      "format": "json",
+      "headers": { "content-type": { "static": "application/json" } },
+      "rules": {
+        "orderId":         { "regex": "ORD-[0-9]{3}", "unique": true },
+        "customerEmail":   { "from": "customers.email" },
+        "customerName":    { "from": "customers.name" },
+        "customerCountry": { "from": "customers.country.code" },
+        "currency":        { "from": "customers.country.currency" }
+      },
+      "pools": {
+        "order": { "id": "orderId", "amount": "total", "customer": "$from.customers", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderPaid", "count": 3,
+      "headers": {
+        "content-type": { "static": "application/x-protobuf" },
+        "traceparent":  { "from": "order.trace" }
+      },
+      "rules": {
+        "orderId":       { "from": "order.id", "take": true },
+        "amount":        { "from": "order.amount" },
+        "currency":      { "from": "order.customer.country.currency" },
+        "customerEmail": { "from": "order.customer.email" }
+      },
+      "pools": {
+        "paid": { "id": "orderId", "order": "$from.order", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "logistics.ShipmentCreated", "count": 2, "topic": "shipments", "key": "shipmentId",
+      "headers": {
+        "content-type": { "static": "application/json" },
+        "traceparent":  { "from": "paid.trace" }
+      },
+      "payload": {
+        "shipmentId":       { "regex": "SHP-[0-9]{6}", "unique": true },
+        "orderId":          { "from": "paid.id", "take": true },
+        "carrier":          { "oneOf": ["DHL", "UPS", "FEDEX"] },
+        "customer.name":    { "from": "paid.order.customer.name" },
+        "customer.country": { "from": "paid.order.customer.country.code" },
+        "address.street":   { "faker": "location.streetAddress", "locale": { "from": "paid.order.customer.country.locale" } },
+        "address.city":     { "faker": "location.city", "locale": { "from": "paid.order.customer.country.locale" } },
+        "address.country":  { "field": "customer.country" },
+        "parcels":          { "int": [1, 3] },
+        "createdAt":        { "iso": "recent" }
+      }
+    }
+  ]
+}
