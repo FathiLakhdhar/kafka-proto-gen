@@ -3,11 +3,19 @@
   "typeHeader": "event-type",
 
   "datasets": {
+    "countries": {
+      "records": [
+        { "code": "FR", "name": "France",  "locale": "fr", "currency": "EUR" },
+        { "code": "DE", "name": "Germany", "locale": "de", "currency": "EUR" },
+        { "code": "ES", "name": "Spain",   "locale": "es", "currency": "EUR" }
+      ]
+    },
     "users": {
-      "size": 5,
+      "size": 6,
       "fields": {
-        "name":  { "faker": "person.fullName" },
-        "email": { "email": true, "unique": true }
+        "country": { "ref": "countries" },
+        "name":    { "faker": "person.fullName", "locale": { "field": "country.locale" } },
+        "email":   { "email": true, "locale": { "field": "country.locale" }, "unique": true }
       }
     },
     "customers": {
@@ -19,7 +27,7 @@
       "fields": {
         "id":       { "regex": "CT-[0-9]{4}", "unique": true },
         "customer": { "ref": "customers" },
-        "currency": { "oneOf": ["EUR", "USD"] }
+        "currency": { "field": "customer.country.currency" }
       }
     }
   },
@@ -45,7 +53,8 @@
         "contractId":    { "from": "contracts.id" },
         "currency":      { "from": "contracts.currency" },
         "customerEmail": { "from": "contracts.customer.email" },
-        "customerName":  { "from": "contracts.customer.name" }
+        "customerName":  { "from": "contracts.customer.name" },
+        "customerCountry": { "from": "contracts.customer.country.code" }
       },
       "pools": {
         "order": { "id": "orderId", "amount": "total", "contract": "$from.contracts", "trace": "$header.traceparent" }

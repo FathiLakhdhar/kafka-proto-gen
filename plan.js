@@ -1,5 +1,5 @@
 const protobuf = require("protobufjs");
-const { faker } = require("@faker-js/faker");
+const { faker, allFakers } = require("@faker-js/faker");
 const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
 const path = require("path");
@@ -55,9 +55,9 @@ const toTs = (d) => {
   const ms = new Date(d).getTime();
   return { seconds: Math.floor(ms / 1000), nanos: (ms % 1000) * 1e6 };
 };
-const fakerFn = (p) => {
+const fakerFn = (p, fk = faker) => {
   const i = p.lastIndexOf(".");
-  const mod = i < 0 ? faker : get(faker, p.slice(0, i));
+  const mod = i < 0 ? fk : get(fk, p.slice(0, i));
   const fn = mod?.[p.slice(i + 1)];
   return typeof fn === "function" ? fn.bind(mod) : null;
 };
@@ -149,8 +149,8 @@ function byRule(r, obj) {
   if (r.regex) return faker.helpers.fromRegExp(r.regex);
   if (r.oneOf) return faker.helpers.arrayElement(r.oneOf);
   if (r.int) return faker.number.int({ min: r.int[0], max: r.int[1] });
-  if (r.email) return faker.internet.email();
-  if (r.faker) return fakerFn(r.faker)(...(r.args || []));
+  if (r.email) return fakerFor(r, obj).internet.email();
+  if (r.faker) return fakerFn(r.faker, fakerFor(r, obj))(...(r.args || []));
   if (r.field) return get(obj, r.field);
   if (r.traceparent)
     return `00-${hex(32)}-${hex(16)}-${Math.random() < (r.traceparent.sampled ?? 1) ? "01" : "00"}`;
@@ -161,6 +161,17 @@ function byRule(r, obj) {
   }
   throw Error(`unknown rule ${JSON.stringify(r)}`);
 }
+
+// "locale" picks a localized faker: a locale id like "fr", or a rule that produces one
+function fakerFor(r, obj) {
+  if (!r.locale) return faker;
+  const loc = typeof r.locale === "string" ? r.locale : byRule(r.locale, obj);
+  if (!allFakers[loc]) throw Error(`unknown faker locale ${JSON.stringify(loc)}`);
+  return allFakers[loc];
+}
+// a rule and the rules nested in it (fallback, locale)
+const rulesIn = (r) => [r, ...(r.fallback ? rulesIn(r.fallback) : []),
+  ...(r.locale && typeof r.locale === "object" ? rulesIn(r.locale) : [])];
 
 // "unique": true regenerates until the value hasn't been used in this scope (a dataset or event field)
 const seen = new Map();
@@ -202,6 +213,12 @@ function checkRule(r, where, reads, inDataset = false) {
   const kind = RULES.find((k) => k in r);
   if (!kind) throw Error(`${where}: unknown rule ${JSON.stringify(r)} (expected one of ${RULES.join(", ")})`);
   if (kind === "faker" && !fakerFn(r.faker)) throw Error(`${where}: faker has no function "${r.faker}"`);
+  if (r.locale != null) {
+    if (kind !== "faker" && kind !== "email") throw Error(`${where}: "locale" only works with faker and email rules`);
+    if (typeof r.locale === "string" && !allFakers[r.locale])
+      throw Error(`${where}: unknown faker locale "${r.locale}" (e.g. ${["fr", "de", "es", "en_GB"].join(", ")})`);
+    if (typeof r.locale === "object") checkRule(r.locale, `${where} locale`, reads, inDataset);
+  }
   if (READS.has(kind)) {
     checkSpec(specOf(r), where, r.take && !inDataset); // dataset sizes are counted after building
     if (reads && !r.fallback) reads.push({ key: parseSpec(specOf(r)).key, take: !!r.take });
@@ -222,8 +239,12 @@ function checkPath(type, p, where) {
 const dsDeps = {};
 for (const [n, d] of Object.entries(DS)) {
   const where = `dataset "${n}"`;
-  if (d.from == null && !(Number.isInteger(d.size) && d.size >= 0))
-    throw Error(`${where}: needs a whole-number "size", or "from" another dataset`);
+  if (d.records != null) {
+    if (!Array.isArray(d.records) || d.records.some((x) => !x || typeof x !== "object" || Array.isArray(x)))
+      throw Error(`${where}: "records" must be a list of objects`);
+    if (d.size != null || d.from != null) throw Error(`${where}: use one of "records", "size" or "from"`);
+  } else if (d.from == null && !(Number.isInteger(d.size) && d.size >= 0))
+    throw Error(`${where}: needs a whole-number "size", "from" another dataset, or a list of "records"`);
   if (d.size != null && !(Number.isInteger(d.size) && d.size >= 0)) throw Error(`${where}: "size" must be a whole number`);
   const deps = new Set();
   const dep = (spec, w) => {
@@ -238,7 +259,7 @@ for (const [n, d] of Object.entries(DS)) {
   for (const [k, r] of Object.entries(d.fields || {})) {
     const w = `${where} fields.${k}`;
     checkRule(r, w, null, true);
-    for (let x = r; x; x = x.fallback) if (specOf(x)) dep(specOf(x), w);
+    for (const x of rulesIn(r)) if (specOf(x)) dep(specOf(x), w);
   }
   dsDeps[n] = deps;
 }
@@ -263,7 +284,8 @@ for (const n of dsOrder) {
     if (size > all.length)
       throw Error(`dataset "${n}": wants ${size} records from "${d.from}", which only has ${all.length}`);
     base = faker.helpers.arrayElements(all, size);
-  } else base = Array.from({ length: d.size }, () => ({}));
+  } else if (d.records) base = d.records;
+  else base = Array.from({ length: d.size }, () => ({}));
   for (const b of base) {
     picked = {};
     const rec = { ...b };

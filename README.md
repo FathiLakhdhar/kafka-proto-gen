@@ -134,6 +134,10 @@ Any rule can also have:
 
 - **`"unique": true`**: regenerates the value until it hasn't been used before for that field. Use it for IDs, like a primary key. If the rule can't produce enough different values (say, 1000 IDs from `CT-[0-9]{2}`), the run stops with an error.
 
+`faker` and `email` rules can also have:
+
+- **`"locale"`**: generates the value for a country, with local names, phone formats, cities and email domains. Use a fixed [Faker locale](https://fakerjs.dev/guide/localization.html) such as `"fr"`, `"de"`, `"es"` or `"en_GB"`, or a rule that produces one. For example, `{ "field": "country.locale" }` uses the locale of the record's own country.
+
 `fromPool` still works as another name for `from`.
 
 ### Datasets
@@ -141,21 +145,30 @@ Any rule can also have:
 Datasets are built once at startup, in dependency order, and logged to stderr:
 
 ```
+dataset countries: 3 records
 dataset users: 1000 records
 dataset customers: 300 records (vip 60, regular 240)
 dataset contracts: 500 records
 ```
 
-There are three ways to build one:
+There are four ways to build one:
 
 ```json
 "datasets": {
+  "countries": {
+    "records": [
+      { "code": "FR", "name": "France",  "locale": "fr", "currency": "EUR" },
+      { "code": "DE", "name": "Germany", "locale": "de", "currency": "EUR" },
+      { "code": "ES", "name": "Spain",   "locale": "es", "currency": "EUR" }
+    ]
+  },
   "users": {
     "size": 1000,
     "fields": {
-      "id":    { "uuid": true },
-      "name":  { "faker": "person.fullName" },
-      "email": { "email": true, "unique": true }
+      "id":      { "uuid": true },
+      "country": { "ref": "countries" },
+      "name":    { "faker": "person.fullName", "locale": { "field": "country.locale" } },
+      "email":   { "email": true, "locale": { "field": "country.locale" }, "unique": true }
     }
   },
   "customers": {
@@ -168,21 +181,23 @@ There are three ways to build one:
     "fields": {
       "id":       { "regex": "CT-[0-9]{6}", "unique": true },
       "customer": { "ref": "customers" },
-      "currency": { "oneOf": ["EUR", "USD", "GBP"] }
+      "currency": { "field": "customer.country.currency" }
     }
   }
 }
 ```
 
-1. **Generated** (`users`): `size` records, each built from `fields`.
-2. **Derived** (`customers`): `from` picks `size` **different** records of another dataset or sub-pool (all of them if `size` is left out). Each record keeps its source fields (`id`, `name`, `email`) and adds its own `fields`. This is a subset with extra columns.
-3. **Linked** (`contracts`): `{ "ref": "customers" }` stores a whole customer record in each contract, so you can read through it later: `contracts.customer.email`. Many contracts can share a customer, like a foreign key. Add `"take": true` to give each contract its own customer.
+1. **Fixed** (`countries`): `records` lists the rows yourself. Use it for real reference data such as countries, currencies or product categories. `fields` can still add generated values to each row.
+2. **Generated** (`users`): `size` records, each built from `fields`. Here each user links to a random country and gets a name and email in that country's locale. The country mix is random, about the same number per country.
+3. **Derived** (`customers`): `from` picks `size` **different** records of another dataset or sub-pool (all of them if `size` is left out). Each record keeps its source fields (`id`, `name`, `email`) and adds its own `fields`. This is a subset with extra columns.
+4. **Linked** (`contracts`): `{ "ref": "customers" }` stores a whole customer record in each contract, so you can read through it later: `contracts.customer.email` or `contracts.customer.country.code`. Many contracts can share a customer, like a foreign key. Add `"take": true` to give each contract its own customer.
 
 `fields` are filled in order, so a `field` rule can use a value set earlier in the same record. Datasets can read other datasets, but not pools, which are still empty at startup.
 
 | Key      | Description |
 |----------|-------------|
-| `size`   | Number of records. Required unless `from` is set |
+| `records` | Fixed list of rows. Can't be combined with `size` or `from` |
+| `size`   | Number of records. Required unless `from` or `records` is set |
 | `from`   | Dataset or sub-pool to derive from, e.g. `users` or `customers/vip` |
 | `fields` | Field name → rule |
 | `split`  | Sub-pool name → share (see [Sub-pools](#sub-pools)) |
@@ -350,7 +365,8 @@ Before any message is generated or sent, the plan is checked and the run stops w
 
 - an event is missing `type`, `proto` or `topic`, or the proto or type can't be loaded
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
-- a rule uses an unknown rule type (`{ "rgex": "..." }`) or a Faker function that doesn't exist
+- a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
+- `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
 - a rule path, `key` or pool record path doesn't exist in the message
 - a `field` rule is used on a message field
 - a `from`, `ref` or `$from` names a dataset, pool or sub-pool that doesn't exist

@@ -43,6 +43,7 @@ message OrderCreated {
   google.protobuf.Timestamp created_at = 8;
   string contract_id = 9;
   string customer_name = 10;
+  string customer_country = 11;
 }
 
 message OrderPaid {
