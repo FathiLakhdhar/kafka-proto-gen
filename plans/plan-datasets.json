@@ -1,0 +1,99 @@
+{
+  "brokers": ["localhost:9092"],
+  "clientId": "kafka-proto-gen",
+  "ratePerSec": 100,
+  "dryRun": true,
+  "outDir": null,
+  "typeHeader": "event-type",
+
+  "datasets": {
+    "users": {
+      "size": 1000,
+      "fields": {
+        "id":    { "uuid": true },
+        "name":  { "faker": "person.fullName" },
+        "email": { "email": true, "unique": true }
+      }
+    },
+    "customers": {
+      "from": "users", "size": 300,
+      "fields": { "customerNo": { "regex": "CUS-[0-9]{6}", "unique": true } },
+      "split": { "vip": 20, "regular": 80 }
+    },
+    "contracts": {
+      "size": 500,
+      "fields": {
+        "id":       { "regex": "CT-[0-9]{6}", "unique": true },
+        "customer": { "ref": "customers" },
+        "currency": { "oneOf": ["EUR", "USD", "GBP"] }
+      }
+    }
+  },
+
+  "pools": {
+    "order":   { "split": { "toPay": 80, "toCancel": 15, "open": 5 } },
+    "payment": {}
+  },
+
+  "defaults": {
+    "topic": "orders",
+    "proto": "order.proto",
+    "key": "orderId",
+    "rules": {
+      "createdAt": { "iso": "recent" }
+    },
+    "headers": {
+      "traceparent":  { "traceparent": { "sampled": 0.9 } },
+      "content-type": { "static": "application/x-protobuf" }
+    }
+  },
+
+  "events": [
+    {
+      "type": "shop.OrderCreated", "count": 700,
+      "rules": {
+        "orderId":        { "uuid": true },
+        "reference":      { "regex": "EX[0-9]{4}D[0-9]{4}", "unique": true },
+        "contractId":     { "from": "contracts.id" },
+        "currency":       { "from": "contracts.currency" },
+        "customerEmail":  { "from": "contracts.customer.email" },
+        "customerName":   { "from": "contracts.customer.name" },
+        "items.sku":      { "regex": "SKU-[A-Z]{3}-[0-9]{3}" },
+        "items.quantity": { "int": [1, 5] }
+      },
+      "pools": {
+        "order": { "id": "orderId", "amount": "total", "contract": "$from.contracts", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderPaid", "count": 500,
+      "rules": {
+        "orderId":       { "from": "order/toPay.id", "take": true },
+        "amount":        { "from": "order/toPay.amount" },
+        "currency":      { "from": "order/toPay.contract.currency" },
+        "customerEmail": { "from": "order/toPay.contract.customer.email" },
+        "paymentId":     { "regex": "PAY-[0-9]{8}", "unique": true }
+      },
+      "headers": { "traceparent": { "from": "order/toPay.trace" } },
+      "pools": {
+        "payment": { "id": "paymentId", "order": "orderId", "amount": "amount", "currency": "currency",
+                     "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderCancelled", "count": 100, "topic": "orders-cancelled",
+      "rules": { "orderId": { "from": "order/toCancel.id", "take": true } },
+      "headers": { "traceparent": { "from": "order/toCancel.trace" } }
+    },
+    {
+      "type": "shop.PaymentRefunded", "count": 50, "topic": "payments", "key": "paymentId",
+      "rules": {
+        "paymentId": { "from": "payment.id", "take": true },
+        "orderId":   { "from": "payment.order" },
+        "amount":    { "from": "payment.amount" },
+        "currency":  { "from": "payment.currency" }
+      },
+      "headers": { "traceparent": { "from": "payment.trace" } }
+    }
+  ]
+}

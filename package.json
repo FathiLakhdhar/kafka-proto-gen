@@ -1,0 +1,20 @@
+{
+  "name": "kafka-proto-gen",
+  "version": "1.0.0",
+  "main": "plan.js",
+  "scripts": {
+    "start": "node plan.js plans/plan.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@faker-js/faker": "^10.6.0",
+    "kafkajs": "^2.2.4",
+    "protobufjs": "^8.8.1"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

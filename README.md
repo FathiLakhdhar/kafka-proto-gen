@@ -1,0 +1,370 @@
+# kafka-proto-gen
+
+Generates fake Protobuf events from a JSON plan and publishes them to Kafka, or prints them for a dry run.
+
+- Fills every field with [Faker](https://fakerjs.dev) data, unless a rule says otherwise.
+- Builds **datasets** of reference data at startup (users, customers, contracts…), which can be derived from and linked to each other like database tables.
+- Links related events through **pools**. For example, `OrderPaid` reuses the `orderId`, amount and `traceparent` of an earlier `OrderCreated`.
+- Picks event types by weight, or produces an exact count of each.
+- Sends at a fixed rate in batches grouped by topic, with Kafka keys and headers.
+- Checks the plan against the `.proto` files at startup, so typos fail before anything is sent.
+
+## Requirements
+
+- Node.js **22.12 or later** (needed to `require()` Faker v10, which is ESM-only)
+- A Kafka broker, unless you only do dry runs
+
+## Install
+
+```sh
+npm install
+```
+
+## Usage
+
+```sh
+npm start                        # runs plans/plan.json
+node plan.js path/to/plan.json   # runs any plan
+```
+
+With `"dryRun": true`, each message is printed to stdout as one JSON line, after encoding and decoding it, so you see exactly what would go on the wire. Progress and dataset sizes go to stderr, which keeps the output clean:
+
+```sh
+npm start > out.jsonl
+```
+
+Press Ctrl+C once to stop after the current batch, or twice to force quit.
+
+## Project layout
+
+```
+plan.js                   the generator
+plans/plan.json           simple order lifecycle, mixed by weight
+plans/plan-quotas.json    the same lifecycle with exact counts per event
+plans/plan-datasets.json  full example: users → customers → contracts, orders, payments, refunds
+plans/plan-small.json     small example (22 messages) of a full order lifecycle, easy to check by eye
+plans/order.proto         schema used by the example plans
+```
+
+## Concepts
+
+A plan has two kinds of named record collections. Events read both the same way.
+
+| | Datasets | Pools |
+|---|---|---|
+| What | Reference data: users, customers, contracts… | Event state: created orders, payments made… |
+| Filled | Once, at startup, before any event | During the run, by events |
+| Built from | Rules, or other datasets | Values from generated messages |
+| Database analogy | Tables loaded before the test | Rows the app inserts while it runs |
+
+Both can be **split** into sub-pools that don't overlap, for example `customers/vip` and `customers/regular`, or `order/toPay` and `order/toCancel`.
+
+## Plan reference
+
+### Top-level settings
+
+| Key          | Description |
+|--------------|-------------|
+| `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]` |
+| `clientId`   | Kafka client id (default `kafka-proto-gen`) |
+| `count`      | Total number of messages to generate. Required with weights; optional with quotas, where it must equal the sum of event counts |
+| `ratePerSec` | Messages per one-second batch (default: all at once) |
+| `dryRun`     | `true` prints messages instead of sending them (no pause between batches) |
+| `outDir`     | If set, also writes each encoded message to `NNNN-<Type>.protobin` |
+| `typeHeader` | If set, adds a header with this name holding the full message type |
+| `datasets`   | Reference data built at startup (see [Datasets](#datasets)) |
+| `pools`      | Pools that events fill and read (see [Pools](#pools)) |
+| `defaults`   | Settings shared by every event (see below) |
+| `events`     | List of event definitions |
+
+Paths in `proto` and `outDir` are relative to the **plan file**, not the folder you run from.
+
+### Events and defaults
+
+Each event is merged on top of `defaults`. `rules` and `headers` are merged key by key, and setting a key to `null` removes the default for that event.
+
+| Key       | Description |
+|-----------|-------------|
+| `type`    | Fully qualified message type, e.g. `shop.OrderCreated` (required) |
+| `proto`   | `.proto` file containing the type (required) |
+| `topic`   | Kafka topic (required) |
+| `weight`  | How often this event is picked relative to others (default `1`) |
+| `count`   | Exact number of messages for this event (see [Weights or quotas](#weights-or-quotas)) |
+| `key`     | Field path used as the Kafka message key, e.g. `orderId` |
+| `rules`   | Field path → rule, overriding the random value for that field |
+| `headers` | Header name → rule |
+| `pools`   | Pool name → record to add after each message (see [Pools](#pools)) |
+
+```json
+"defaults": {
+  "topic": "orders",
+  "proto": "order.proto",
+  "rules":   { "currency": { "static": "EUR" } },
+  "headers": { "tracestate": { "static": "app=orders" } }
+},
+"events": [
+  { "type": "shop.OrderCreated", "weight": 70 },
+  { "type": "shop.OrderCancelled", "weight": 5, "topic": "orders-cancelled",
+    "rules": { "currency": null }, "headers": { "tracestate": null } }
+]
+```
+
+### Field paths
+
+Field paths use the camelCase names protobufjs generates (`order_id` → `orderId`) and dots for nesting: `items.sku`. A rule on a repeated field applies to every element. A rule on a field inside a `oneof` makes that branch always chosen.
+
+### Rules
+
+| Rule | Example | Produces |
+|------|---------|----------|
+| `static`      | `{ "static": "EUR" }` | That exact value |
+| `uuid`        | `{ "uuid": true }` | A random UUID |
+| `iso`         | `{ "iso": "recent" }` | A date: `"past"`, `"future"` or `"recent"`. Becomes a proper value for `google.protobuf.Timestamp` fields, otherwise an ISO string |
+| `regex`       | `{ "regex": "EX[0-9]{4}" }` | A string matching the pattern |
+| `oneOf`       | `{ "oneOf": ["CARD", "PAYPAL"] }` | One of the listed values. Enum names work |
+| `int`         | `{ "int": [1, 5] }` | An integer between min and max, inclusive |
+| `email`       | `{ "email": true }` | A random email address |
+| `faker`       | `{ "faker": "person.fullName" }` | Any [Faker](https://fakerjs.dev/api/) function, with optional `"args": [...]` |
+| `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`) |
+| `field`       | `{ "field": "orderId" }` | A value from the record being built. **Headers and datasets only** |
+| `from`        | `{ "from": "contracts.currency" }` | A value from a dataset or pool (see [Reading](#reading-datasets-and-pools)) |
+| `ref`         | `{ "ref": "customers" }` | A whole record from a dataset or pool, as a link (same as `from` without a property) |
+
+Any rule can also have:
+
+- **`"unique": true`**: regenerates the value until it hasn't been used before for that field. Use it for IDs, like a primary key. If the rule can't produce enough different values (say, 1000 IDs from `CT-[0-9]{2}`), the run stops with an error.
+
+`fromPool` still works as another name for `from`.
+
+### Datasets
+
+Datasets are built once at startup, in dependency order, and logged to stderr:
+
+```
+dataset users: 1000 records
+dataset customers: 300 records (vip 60, regular 240)
+dataset contracts: 500 records
+```
+
+There are three ways to build one:
+
+```json
+"datasets": {
+  "users": {
+    "size": 1000,
+    "fields": {
+      "id":    { "uuid": true },
+      "name":  { "faker": "person.fullName" },
+      "email": { "email": true, "unique": true }
+    }
+  },
+  "customers": {
+    "from": "users", "size": 300,
+    "fields": { "customerNo": { "regex": "CUS-[0-9]{6}", "unique": true } },
+    "split": { "vip": 20, "regular": 80 }
+  },
+  "contracts": {
+    "size": 500,
+    "fields": {
+      "id":       { "regex": "CT-[0-9]{6}", "unique": true },
+      "customer": { "ref": "customers" },
+      "currency": { "oneOf": ["EUR", "USD", "GBP"] }
+    }
+  }
+}
+```
+
+1. **Generated** (`users`): `size` records, each built from `fields`.
+2. **Derived** (`customers`): `from` picks `size` **different** records of another dataset or sub-pool (all of them if `size` is left out). Each record keeps its source fields (`id`, `name`, `email`) and adds its own `fields`. This is a subset with extra columns.
+3. **Linked** (`contracts`): `{ "ref": "customers" }` stores a whole customer record in each contract, so you can read through it later: `contracts.customer.email`. Many contracts can share a customer, like a foreign key. Add `"take": true` to give each contract its own customer.
+
+`fields` are filled in order, so a `field` rule can use a value set earlier in the same record. Datasets can read other datasets, but not pools, which are still empty at startup.
+
+| Key      | Description |
+|----------|-------------|
+| `size`   | Number of records. Required unless `from` is set |
+| `from`   | Dataset or sub-pool to derive from, e.g. `users` or `customers/vip` |
+| `fields` | Field name → rule |
+| `split`  | Sub-pool name → share (see [Sub-pools](#sub-pools)) |
+
+### Pools
+
+Pools are declared at the top level. A pool with no options needs only `{}`:
+
+```json
+"pools": {
+  "order":   { "split": { "toPay": 80, "toCancel": 15, "open": 5 } },
+  "payment": {}
+}
+```
+
+An event adds a record to a pool after each message it produces. Each record value is one of:
+
+- a field path, such as `orderId`
+- `$header.<name>`, the header value
+- `$from.<dataset or pool>`, the record this message read from that collection, stored as a link
+
+```json
+{ "type": "shop.OrderCreated",
+  "pools": {
+    "order": { "id": "orderId", "amount": "total", "contract": "$from.contracts", "trace": "$header.traceparent" }
+  } }
+```
+
+An event can add to several pools. A pool that isn't declared at the top level is created automatically when an event adds to it. The older `"pool": { "name": ..., "add": ... }` syntax still works.
+
+Pools live in memory for a single run. With weights, each pool keeps at most 10,000 records, dropping the oldest first. With quotas there's no limit, because the startup check counts on every record staying available.
+
+### Sub-pools
+
+`split` divides a dataset or pool into sub-pools that don't overlap. Each new record goes into exactly one of them, following the shares. Records are dealt out in a fixed rotation rather than at random, so the shares are exact: 700 orders split 80/15/5 give 560 / 105 / 35.
+
+Typical uses:
+
+- **Separate paths in a lifecycle.** Paid and cancelled orders come from different sub-pools, so they never compete for the same order. A sub-pool nobody reads (`open`) gives orders that are never closed.
+- **Segments of reference data.** For example, an event that only uses `customers/vip`.
+
+### Reading datasets and pools
+
+`from` and `ref` take a path of the form `<name>[/<sub-pool>][.<property path>]`:
+
+| Path | Reads |
+|------|-------|
+| `contracts.id` | The `id` of a record from any part of `contracts` |
+| `customers/vip.email` | The `email` of a record from the `vip` sub-pool only |
+| `contracts.customer.email` | Through a link: the email of the contract's customer |
+| `order/toPay.contract.currency` | Through a link stored in a pool record |
+| `customers` | The whole record (what `ref` does) |
+
+The same behaviour applies whatever is read:
+
+- **One record per message.** All reads of the same collection, or the same sub-pool, in one message use the same record. A contract's ID, currency and customer email always match.
+- **`take: true`** removes the record, for one-time transitions such as an order that can't be paid twice. In events you take from a sub-pool, not from all of a split collection.
+- **Without `fallback`**, the event only runs once the collection has records. The first messages are always of the events that fill the pools, and no orphan references are produced.
+- **With `fallback`**, the event can run while the collection is empty and uses the fallback rule instead.
+
+```json
+{ "type": "shop.OrderPaid",
+  "rules": {
+    "orderId":       { "from": "order/toPay.id", "take": true },
+    "amount":        { "from": "order/toPay.amount" },
+    "currency":      { "from": "order/toPay.contract.currency" },
+    "customerEmail": { "from": "order/toPay.contract.customer.email" }
+  },
+  "headers": { "traceparent": { "from": "order/toPay.trace" } } }
+```
+
+### Lifecycles: one pool per state
+
+`take` removes a record, so later events can't find it. Leaving `take` off lets an order be paid twice, or paid and cancelled. To get both safety and reachability, **move** the record: the event that takes it adds it to the pool for the next state.
+
+```json
+"pools": { "order": { "split": { "toPay": 2, "toCancel": 1 } }, "paid": {}, "shipped": {} }
+```
+
+```json
+{ "type": "shop.OrderPaid",
+  "rules": { "orderId": { "from": "order/toPay.id", "take": true } },
+  "pools": { "paid": { "id": "orderId", "order": "$from.order/toPay", "trace": "$header.traceparent" } } },
+
+{ "type": "shop.OrderShipped",
+  "rules": { "orderId": { "from": "paid.id", "take": true },
+             "customerEmail": { "from": "paid.order.contract.customer.email" } },
+  "pools": { "shipped": { "id": "orderId", "order": "$from.paid.order" } } }
+```
+
+```
+OrderCreated ──▶ order ─┬─ toPay ──OrderPaid──▶ paid ──OrderShipped──▶ shipped ──OrderDelivered──▶ (done)
+                        └─ toCancel ──OrderCancelled──▶ (done)
+```
+
+- Each order is in exactly one pool at a time, so it can't skip a step or happen twice.
+- `"order": "$from.order/toPay"` carries a link to the original record forward, so later events can still read its amount, currency or customer.
+- Events that can repeat within a state read **without** `take`, e.g. `OrderNoteAdded` from `paid`. They stop automatically once the order moves on.
+
+| Kind of event | Read with | Example |
+|---|---|---|
+| Changes the state (happens once) | `take: true`, then add to the next pool | Paid, Shipped, Cancelled |
+| Happens within a state (repeatable) | no `take` | NoteAdded, AddressChanged |
+
+`plans/plan-small.json` is a complete, small version of this flow.
+
+### Weights or quotas
+
+A plan decides the mix of events in one of two ways:
+
+| | Weights | Quotas |
+|---|---|---|
+| Set on each event | `"weight": 70` | `"count": 700` |
+| Total messages | Top-level `count` | Sum of the event counts |
+| Messages per event | About the weight's share, varies per run | Exactly the count |
+| Typical use | Realistic traffic, scaling by changing one number | Tests that check exact numbers |
+
+With **quotas**, every event needs a `count`, and `weight` isn't allowed. Events are still interleaved randomly: each message picks an event by how many it has left, so all events finish together rather than one after another.
+
+Quotas are checked against datasets, pools and sub-pools at startup, so the run can't get stuck halfway:
+
+- events can't take more records than a dataset has, or than the events adding to a pool produce
+- for a sub-pool, only its share of the added records counts
+- if other events read without taking, the takers must leave at least one record
+- every collection that is read must get records
+
+```
+Error: "order/toPay": shop.OrderPaid (600) take 600 records, but shop.OrderCreated (700) add 700, and only 560 of them go to "order/toPay"
+```
+
+## Example: plans/plan-datasets.json
+
+```
+users (1000) ──from──▶ customers (300, split vip/regular) ◀──ref── contracts (500)
+                                                                       │ read by
+OrderCreated (700) ─────────────────────────────────────────────────────┘
+   │ adds to order pool, split toPay 80 / toCancel 15 / open 5
+   ├──▶ OrderPaid (500)       takes from order/toPay, adds to payment pool
+   │       └──▶ PaymentRefunded (50)  takes from payment
+   └──▶ OrderCancelled (100)  takes from order/toCancel
+```
+
+Every payment carries its order's amount, currency, customer email and trace. Every refund matches its payment. No order is both paid and cancelled, and 100 orders stay open.
+
+## Values without a rule
+
+| Field type | Generated value |
+|------------|-----------------|
+| `string` | Two lorem words |
+| integers | 0–100000 |
+| `float` / `double` | 0–1000, two decimals |
+| `bool` | Random |
+| `bytes` | 8 random alphanumeric bytes |
+| enum | A random value, never `*_UNSPECIFIED` |
+| `google.protobuf.Timestamp` | A recent date |
+| nested message | Generated recursively, up to 4 levels deep |
+| `repeated` | 1–3 elements |
+| `map` | One entry, with a key of the right type |
+| `oneof` | One random branch, unless a rule forces one |
+| proto3 `optional` | Left out about 30% of the time |
+
+## Validation
+
+Before any message is generated or sent, the plan is checked and the run stops with a clear error if:
+
+- an event is missing `type`, `proto` or `topic`, or the proto or type can't be loaded
+- the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
+- a rule uses an unknown rule type (`{ "rgex": "..." }`) or a Faker function that doesn't exist
+- a rule path, `key` or pool record path doesn't exist in the message
+- a `field` rule is used on a message field
+- a `from`, `ref` or `$from` names a dataset, pool or sub-pool that doesn't exist
+- an event takes from all of a split collection instead of one sub-pool
+- a dataset reads a pool, datasets depend on each other in a loop, or a derived dataset wants more records than its source has
+- an event adds to a dataset, or a dataset and a pool share a name
+- a pool is read but no event adds to it
+- a `unique` rule runs out of values, or a dataset `take` runs out of records
+- quotas don't fit the datasets and pools (see [Weights or quotas](#weights-or-quotas))
+
+For example:
+
+```
+Error: shop.OrderPaid rules.orderId: pool "order" has no sub-pool "toPai" (it has toPay, toCancel, open)
+```
+
+Messages are also checked with protobufjs before encoding.

@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package shop;
+
+import "google/protobuf/timestamp.proto";
+
+enum PaymentMethod {
+  PAYMENT_METHOD_UNSPECIFIED = 0;
+  CARD = 1;
+  PAYPAL = 2;
+  BANK_TRANSFER = 3;
+}
+
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  CUSTOMER_REQUEST = 1;
+  OUT_OF_STOCK = 2;
+  PAYMENT_FAILED = 3;
+  FRAUD_SUSPECTED = 4;
+}
+
+enum Carrier {
+  CARRIER_UNSPECIFIED = 0;
+  DHL = 1;
+  UPS = 2;
+  FEDEX = 3;
+}
+
+message LineItem {
+  string sku = 1;
+  int32 quantity = 2;
+  double unit_price = 3;
+}
+
+message OrderCreated {
+  string order_id = 1;
+  string reference = 2;
+  string customer_email = 3;
+  string currency = 4;
+  double total = 5;
+  repeated LineItem items = 6;
+  map<string, string> metadata = 7;
+  google.protobuf.Timestamp created_at = 8;
+  string contract_id = 9;
+  string customer_name = 10;
+}
+
+message OrderPaid {
+  string order_id = 1;
+  PaymentMethod payment_method = 2;
+  double amount = 3;
+  string currency = 4;
+  oneof payment_ref {
+    string card_last4 = 5;
+    string paypal_transaction_id = 6;
+    string bank_reference = 7;
+  }
+  google.protobuf.Timestamp created_at = 8;
+  string payment_id = 9;
+  string customer_email = 10;
+}
+
+message PaymentRefunded {
+  string payment_id = 1;
+  string order_id = 2;
+  double amount = 3;
+  string currency = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message OrderCancelled {
+  string order_id = 1;
+  CancelReason reason = 2;
+  optional string note = 3;
+  map<int32, int32> refunded_quantity_by_line = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message OrderShipped {
+  string order_id = 1;
+  Carrier carrier = 2;
+  string tracking_number = 3;
+  string customer_email = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message OrderDelivered {
+  string order_id = 1;
+  string tracking_number = 2;
+  string received_by = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message OrderNoteAdded {
+  string order_id = 1;
+  string author = 2;
+  string note = 3;
+  google.protobuf.Timestamp created_at = 4;
+}

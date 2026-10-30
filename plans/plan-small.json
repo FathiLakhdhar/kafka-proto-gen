@@ -1,0 +1,104 @@
+{
+  "dryRun": true,
+  "typeHeader": "event-type",
+
+  "datasets": {
+    "users": {
+      "size": 5,
+      "fields": {
+        "name":  { "faker": "person.fullName" },
+        "email": { "email": true, "unique": true }
+      }
+    },
+    "customers": {
+      "from": "users", "size": 3,
+      "split": { "vip": 1, "regular": 2 }
+    },
+    "contracts": {
+      "size": 4,
+      "fields": {
+        "id":       { "regex": "CT-[0-9]{4}", "unique": true },
+        "customer": { "ref": "customers" },
+        "currency": { "oneOf": ["EUR", "USD"] }
+      }
+    }
+  },
+
+  "pools": {
+    "order":   { "split": { "toPay": 2, "toCancel": 1 } },
+    "paid":    {},
+    "shipped": {}
+  },
+
+  "defaults": {
+    "topic": "orders",
+    "proto": "order.proto",
+    "key": "orderId",
+    "headers": { "traceparent": { "traceparent": {} } }
+  },
+
+  "events": [
+    {
+      "type": "shop.OrderCreated", "count": 8,
+      "rules": {
+        "orderId":       { "regex": "ORD-[0-9]{3}", "unique": true },
+        "contractId":    { "from": "contracts.id" },
+        "currency":      { "from": "contracts.currency" },
+        "customerEmail": { "from": "contracts.customer.email" },
+        "customerName":  { "from": "contracts.customer.name" }
+      },
+      "pools": {
+        "order": { "id": "orderId", "amount": "total", "contract": "$from.contracts", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderPaid", "count": 4,
+      "rules": {
+        "orderId":       { "from": "order/toPay.id", "take": true },
+        "amount":        { "from": "order/toPay.amount" },
+        "currency":      { "from": "order/toPay.contract.currency" },
+        "customerEmail": { "from": "order/toPay.contract.customer.email" },
+        "paymentId":     { "regex": "PAY-[0-9]{4}", "unique": true }
+      },
+      "headers": { "traceparent": { "from": "order/toPay.trace" } },
+      "pools": {
+        "paid": { "id": "orderId", "order": "$from.order/toPay", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderCancelled", "count": 2, "topic": "orders-cancelled",
+      "rules": { "orderId": { "from": "order/toCancel.id", "take": true } },
+      "headers": { "traceparent": { "from": "order/toCancel.trace" } }
+    },
+    {
+      "type": "shop.OrderNoteAdded", "count": 3,
+      "rules": {
+        "orderId": { "from": "paid.id" },
+        "author":  { "faker": "person.fullName" },
+        "note":    { "faker": "lorem.sentence" }
+      },
+      "headers": { "traceparent": { "from": "paid.trace" } }
+    },
+    {
+      "type": "shop.OrderShipped", "count": 3,
+      "rules": {
+        "orderId":        { "from": "paid.id", "take": true },
+        "trackingNumber": { "regex": "TRK[0-9]{8}", "unique": true },
+        "customerEmail":  { "from": "paid.order.contract.customer.email" }
+      },
+      "headers": { "traceparent": { "from": "paid.trace" } },
+      "pools": {
+        "shipped": { "id": "orderId", "tracking": "trackingNumber", "order": "$from.paid.order", "trace": "$header.traceparent" }
+      }
+    },
+    {
+      "type": "shop.OrderDelivered", "count": 2,
+      "rules": {
+        "orderId":        { "from": "shipped.id", "take": true },
+        "trackingNumber": { "from": "shipped.tracking" },
+        "receivedBy":     { "from": "shipped.order.contract.customer.name" }
+      },
+      "headers": { "traceparent": { "from": "shipped.trace" } }
+    }
+  ]
+}

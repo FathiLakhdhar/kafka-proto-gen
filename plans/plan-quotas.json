@@ -1,0 +1,53 @@
+{
+  "brokers": ["localhost:9092"],
+  "clientId": "kafka-proto-gen",
+  "ratePerSec": 50,
+  "dryRun": true,
+  "outDir": null,
+  "typeHeader": "event-type",
+
+  "defaults": {
+    "topic": "orders",
+    "proto": "order.proto",
+    "key": "orderId",
+    "rules": {
+      "orderId":   { "uuid": true },
+      "currency":  { "static": "EUR" },
+      "createdAt": { "iso": "recent" }
+    },
+    "headers": {
+      "traceparent":  { "traceparent": { "sampled": 0.9 } },
+      "tracestate":   { "static": "app=orders" },
+      "content-type": { "static": "application/x-protobuf" }
+    }
+  },
+
+  "events": [
+    {
+      "type": "shop.OrderCreated", "count": 700,
+      "rules": {
+        "reference":      { "regex": "EX[0-9]{4}D[0-9]{4}" },
+        "customerEmail":  { "email": true },
+        "items.sku":      { "regex": "SKU-[A-Z]{3}-[0-9]{3}" },
+        "items.quantity": { "int": [1, 5] }
+      },
+      "pool": { "name": "open", "add": { "id": "orderId", "trace": "$header.traceparent" } }
+    },
+    {
+      "type": "shop.OrderPaid", "count": 250,
+      "rules": { "orderId": { "fromPool": "open.id", "take": true } },
+      "headers": { "traceparent": { "fromPool": "open.trace" } }
+    },
+    {
+      "type": "shop.OrderCancelled", "count": 50, "topic": "orders-cancelled",
+      "rules": {
+        "orderId":  { "fromPool": "open.id", "take": true },
+        "currency": null
+      },
+      "headers": {
+        "traceparent": { "fromPool": "open.trace" },
+        "tracestate": null
+      }
+    }
+  ]
+}
